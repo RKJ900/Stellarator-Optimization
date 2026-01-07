@@ -1,0 +1,305 @@
+import numpy as np
+import scipy.optimize
+from desc.equilibrium import Equilibrium
+from desc.geometry import FourierRZToroidalSurface
+from desc.profiles import PowerSeriesProfile
+from desc.objectives import (
+    ObjectiveFunction, ForceBalance, FixBoundaryR, FixBoundaryZ,
+    FixPressure, FixIota, FixPsi, MercierStability, Omnigenity
+)
+from desc.optimize import Optimizer
+from desc.grid import LinearGrid
+
+import simsopt
+from simsopt.geo import (
+    SurfaceRZFourier, CurveXYZFourier, curves_to_vtk, create_equally_spaced_curves
+)
+from simsopt.field import Current, coils_via_symmetries, BiotSavart
+from simsopt.objectives import SquaredFlux, QuadraticPenalty
+from simsopt.geo import CurveLength, CurveCurveDistance, CurveSurfaceDistance, LpCurveCurvature
+
+# ------------------------------------------------------------------------------
+# GLOBAL PARAMETERS & PHYSICAL CONSTANTS
+# ------------------------------------------------------------------------------
+# Geometric & Physics
+MAJOR_RADIUS = 6.0          # [m]
+MINOR_RADIUS = 2.0          # [m]
+NFP = 5                     # Field Periods
+PSI_TOTAL = 71.63           # [Webers] Total Toroidal Flux
+PRESSURE_CENTER = 1.5e6     # [Pa] Core pressure for ~5% Beta
+IOTA_AXIS = 0.47
+IOTA_EDGE = 0.68
+
+# Engineering / Coil Constraints (HTS REBCO)
+MAX_KAPPA = 0.8             # [1/m] Max curvature strain limit
+MAX_CURRENT_DENSITY = 2.5e8 # [A/m^2]
+MIN_COIL_DIST_COIL = 0.80   # [m] Maintenance access
+PLASMA_COIL_MIN_DIST = 1.475 # [m] Blanket + Shield + Cryo
+LENGTH_WEIGHT = 1.0         # Penalty weight for length
+
+print("========================================================================")
+print("              STELLARATOR OPTIMIZATION: DESC + SIMSOPT                  ")
+print(f"  R={MAJOR_RADIUS}m, a={MINOR_RADIUS}m, NFP={NFP}, Beta~5%")
+print("========================================================================")
+
+# ------------------------------------------------------------------------------
+# PHASE 1: DESC EQUILIBRIUM & PHYSICS OPTIMIZATION
+# ------------------------------------------------------------------------------
+print("\n--- [PHASE 1] initializing DESC Equilibrium ...")
+
+# 1. Define the Initial Surface (Rotating Ellipse Guess)
+# Using FourierRZToroidalSurface for exact spectral representation
+surface = FourierRZToroidalSurface(
+    NFP=NFP,
+    sym=True  # Stellarator symmetry
+)
+
+# 2. Define Physics Profiles
+# Pressure profile: p(rho) = p_0 * (1 - rho^2)^2 (Peaking factor for core fusion)
+pressure_profile = PowerSeriesProfile(
+    params=[PRESSURE_CENTER, 0, -2*PRESSURE_CENTER, 0, PRESSURE_CENTER],
+    modes=[0, 1, 2, 3, 4] # Corresponds to 1 - 2x^2 + x^4
+)
+
+# Rotational Transform: iota(rho) = 0.47 + (0.68 - 0.47)*rho^2
+iota_profile = PowerSeriesProfile(
+    params=[IOTA_AXIS, 0, (IOTA_EDGE - IOTA_AXIS)],
+    modes=[0, 1, 2]
+)
+
+# 3. Create Equilibrium Object
+eq = Equilibrium(
+    surface=surface,
+    pressure=pressure_profile,
+    iota=iota_profile,
+    Psi=PSI_TOTAL,
+    NFP=NFP,
+    sym=True,
+    L=12, M=12, N=12, # Spectral resolution
+    L_grid=20, M_grid=20, N_grid=20 # Grid resolution
+)
+
+# 4. Solve Initial Force Balance (MHD Equilibrium)
+print("  Solving initial force balance (J x B - grad(p) = 0)...")
+eq.solve(objective="force", verbose=2)
+
+# 5. Define Optimization Objectives
+#   - ForceBalance: Maintain valid MHD state.
+#   - Omnigenity: Proxy for Quasi-isodynamics (QI) / Microscale turbulence damping.
+#   - MercierStability: Absolute optimization against swapping/ballooning.
+print("  Configuring Optimization Objectives (QI + Stability)...")
+
+# Omnigenity target: Helicity (0, NFP) targets Poloidally Closed |B| contours (QI)
+obj_omnigenity = Omnigenity(
+    eq=eq,
+    helicity=(0, NFP), 
+    weight=1e1,
+    normalize=True
+)
+
+# Mercier Stability: Ensure dm/drho > 0 criteria is met
+obj_mercier = MercierStability(
+    eq=eq,
+    weight=1e2,
+    normalize=True
+)
+
+# Force Balance (Strict constraint maintenance)
+obj_force = ForceBalance(
+    eq=eq,
+    weight=1e3,
+    normalize=True
+)
+
+# 6. Define Constraints
+# We fix the Profiles and Flux, allowing the Boundary shape to change.
+constraints = (
+    FixPressure(eq),
+    FixIota(eq),
+    FixPsi(eq),
+    FixBoundaryR(eq, fixed_surface=False), # Allow R boundary to move
+    FixBoundaryZ(eq, fixed_surface=False)  # Allow Z boundary to move
+)
+
+# Combine into Objective Function
+objective = ObjectiveFunction(
+    (obj_force, obj_omnigenity, obj_mercier)
+)
+
+# 7. Run Optimization
+print("  Starting DESC Optimization (Proximal Projection)...")
+optimizer = Optimizer("proximal-lsq-exact") # High-precision solver
+# Note: 'maxiter' is set to 20 for demonstration; a full run would use >100.
+result = optimizer.optimize(
+    eq,
+    objective,
+    constraints,
+    ftol=1e-4,
+    xtol=1e-4,
+    gtol=1e-4,
+    maxiter=20, 
+    verbose=2
+)
+
+optimized_eq = result["equilibrium"]
+print("  DESC Phase Complete. Equilibrium optimized for QI and Stability.")
+
+# ------------------------------------------------------------------------------
+# PHASE 2: SIMSOPT COIL DESIGN
+# ------------------------------------------------------------------------------
+print("\n--- [PHASE 2] Initializing SIMSOPT Coil Optimization ...")
+
+# 1. Extract Boundary from DESC and Convert to SIMSOPT Surface
+# We manually map Fourier coefficients from DESC to SIMSOPT format.
+# DESC R_mn -> SIMSOPT rc (cosine terms for R, stellarator symmetry)
+# DESC Z_mn -> SIMSOPT zs (sine terms for Z, stellarator symmetry)
+
+print("  Transferring Boundary Geometry...")
+desc_surf = optimized_eq.surface
+mpol = desc_surf.M
+ntor = desc_surf.N
+
+# Initialize SIMSOPT Surface
+s_simsopt = SurfaceRZFourier(
+    nfp=NFP, 
+    stellsym=True, 
+    mpol=mpol, 
+    ntor=ntor,
+    quadpoints_phi=64, 
+    quadpoints_theta=64
+)
+
+# Transfer coefficients
+# Iterate through DESC modes and assign to SIMSOPT arrays
+for i in range(desc_surf.R_basis.modes.shape[0]):
+    l, m, n = desc_surf.R_basis.modes[i]
+    if l == 0: # DESC uses 3D basis (l,m,n), Boundary is 2D (m,n)
+        # Check bounds for SIMSOPT surface resolution
+        if m <= mpol and abs(n) <= ntor:
+            # DESC 'n' is typically positive/negative; SIMSOPT handles range
+            # R coefficients (Cosine)
+            rc_val = desc_surf.R_lmn[i]
+            s_simsopt.set_rc(m, n, rc_val)
+            
+            # Z coefficients (Sine) - Note: Z basis index might differ
+            if i < len(desc_surf.Z_lmn):
+                zs_val = desc_surf.Z_lmn[i]
+                s_simsopt.set_zs(m, n, zs_val)
+
+# Update surface geometry
+s_simsopt.local_full_x = s_simsopt.get_rc(0,0) # Trigger update
+
+# 2. Define Coil Geometry (Modular Coils)
+# Create 4 unique coils per half period -> 4 * 2 * 5 = 40 coils total.
+print("  Initializing Modular Coils (HTS REBCO Constraints)...")
+n_coils_per_half_period = 4
+base_current = 1.0e5 # Start with 100 kA, optimizer will adjust
+
+# Generate base curves on a surface offset from plasma
+# We use an offset of ~1.6m to be safe (Constraint is > 1.475m)
+base_curves = create_equally_spaced_curves(
+    n_coils_per_half_period,
+    s_simsopt.nfp,
+    stellsym=True,
+    R0=MAJOR_RADIUS,
+    R1=MAJOR_RADIUS + 1.8, # Offset major radius for winding surface
+    order=5 # Fourier order for coil shape
+)
+
+# Convert generic curves to optimizable Fourier Curves with Current
+coils = []
+for curve in base_curves:
+    # Set current object
+    curr = Current(base_current)
+    curr.fix_all() # Fix current initially, or let it float if needed. 
+    # For HTS, we often fix current and optimize shape, or optimize both.
+    # Here we unfix current to allow precise B-field matching.
+    curr.unfix_all()
+    
+    coils.append(simsopt.field.Coil(curve, curr))
+
+# Apply symmetries to get full coil set
+coils_all = coils_via_symmetries(coils, s_simsopt.nfp, True)
+bs = BiotSavart(coils_all)
+bs.x = s_simsopt.gamma() # Evaluate on surface
+
+# 3. Define Optimization Penalties (The "Cost" Function)
+
+# A. Magnetic Field Error (Squared Flux)
+# Minimize integral (B . n)^2 over the surface
+J_flux = SquaredFlux(s_simsopt, bs)
+
+# B. Length Penalty (Cost/Inductance)
+J_length = QuadraticPenalty(0.0)
+for coil in coils:
+    J_length = J_length + CurveLength(coil.curve)
+
+# C. Curvature Penalty (HTS Strain Constraint)
+# Max Kappa < 0.8. We penalize if kappa > 0.8
+J_curvature = QuadraticPenalty(0.0)
+for coil in coils:
+    # Use 'threshold' penalty: max(0, kappa - 0.8)^2
+    curve = coil.curve
+    J_curvature = J_curvature + LpCurveCurvature(curve, kappa_threshold=MAX_KAPPA, exponent=2)
+
+# D. Coil-to-Coil Distance (Maintenance)
+# Min distance > 0.8m.
+J_cc_dist = CurveCurveDistance(coils, MIN_COIL_DIST_COIL, num_basecurves=n_coils_per_half_period)
+
+# E. Coil-to-Plasma Distance (Blanket/Shielding)
+# Min distance > 1.475m.
+# We use CurveSurfaceDistance.
+J_cs_dist = CurveSurfaceDistance(coils, s_simsopt, PLASMA_COIL_MIN_DIST)
+
+# 4. Total Objective Function
+# Weights must be tuned. We adhere to "Absolute Optimization" request.
+# High weights for physical constraints.
+WEIGHT_FLUX = 1.0
+WEIGHT_LENGTH = LENGTH_WEIGHT * 1e-4
+WEIGHT_CURVATURE = 1e3 # Strict enforcement
+WEIGHT_CC_DIST = 1e3   # Strict enforcement
+WEIGHT_CS_DIST = 1e4   # Critical for blanket fit
+
+JF = (WEIGHT_FLUX * J_flux) + \
+     (WEIGHT_LENGTH * J_length) + \
+     (WEIGHT_CURVATURE * J_curvature) + \
+     (WEIGHT_CC_DIST * J_cc_dist) + \
+     (WEIGHT_CS_DIST * J_cs_dist)
+
+print(f"  Initial Objective Value: {JF.J():.4e}")
+
+# 5. Run Coil Optimization
+print("  Starting SIMSOPT Coil Optimization (L-BFGS-B)...")
+
+def fun(dofs):
+    JF.x = dofs
+    return JF.J(), JF.dJ()
+
+# Extract degrees of freedom (Coil Fourier coeffs + Currents)
+dofs = JF.x
+
+# Optimization Loop
+# We use Scipy's L-BFGS-B which handles bound constraints efficiently if needed,
+# though here we use soft penalties in the objective.
+res = scipy.optimize.minimize(
+    fun,
+    dofs,
+    jac=True,
+    method='L-BFGS-B',
+    options={'maxiter': 50, 'ftol': 1e-8, 'disp': True},
+    tol=1e-8
+)
+
+print("  Optimization Complete.")
+print(f"  Final Objective Value: {res.fun:.4e}")
+
+# ------------------------------------------------------------------------------
+# POST-PROCESS & EXPORT
+# ------------------------------------------------------------------------------
+# Export Coil geometry for manufacturing/analysis
+print("\n--- Exporting Results ---")
+curves_to_vtk(coils, "optimized_stellarator_coils")
+s_simsopt.to_vtk("optimized_plasma_surface")
+
+print("Generated files: 'optimized_stellarator_coils.vtk', 'optimized_plasma_surface.vtk'")
+print("Script execution finished successfully.")

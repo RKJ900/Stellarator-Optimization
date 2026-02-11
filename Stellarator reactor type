@@ -9,6 +9,7 @@ from desc.objectives import (
 )
 from desc.optimize import Optimizer
 from desc.grid import LinearGrid
+from desc.magnetic_fields import OmnigenousField
 
 import simsopt
 from simsopt.geo import (
@@ -79,9 +80,13 @@ eq = Equilibrium(
     L_grid=20, M_grid=20, N_grid=20 # Grid resolution
 )
 
+# Add this line to ensure all transforms and parameters are properly initialized
+eq.set_initial_guess()
+
 # 4. Solve Initial Force Balance (MHD Equilibrium)
 print("  Solving initial force balance (J x B - grad(p) = 0)...")
 eq.solve(objective="force", verbose=2)
+print("  Initial force balance solved.")
 
 # 5. Define Optimization Objectives
 #   - ForceBalance: Maintain valid MHD state.
@@ -90,12 +95,18 @@ eq.solve(objective="force", verbose=2)
 print("  Configuring Optimization Objectives (QI + Stability)...")
 
 # Omnigenity target: Helicity (0, NFP) targets Poloidally Closed |B| contours (QI)
+# Create an OmnigenousField instance with the desired helicity
+omni_field = OmnigenousField(L_B=eq.L, M_B=eq.M, NFP=eq.NFP, helicity=(1, 0))
+print(f"  OmnigenousField created with helicity: {omni_field.helicity}")
+
 obj_omnigenity = Omnigenity(
     eq=eq,
-    helicity=(0, NFP), 
+    field=omni_field, # Pass the OmnigenousField instance here
     weight=1e1,
     normalize=True
 )
+obj_omnigenity.build(eq)
+print(f"  Omnigenity objective created. Initial omnigenity score: {obj_omnigenity.compute():.4e}")
 
 # Mercier Stability: Ensure dm/drho > 0 criteria is met
 obj_mercier = MercierStability(
@@ -103,6 +114,8 @@ obj_mercier = MercierStability(
     weight=1e2,
     normalize=True
 )
+obj_mercier.build(eq)
+print(f"  Mercier Stability objective created. Initial Mercier score: {obj_mercier.compute():.4e}")
 
 # Force Balance (Strict constraint maintenance)
 obj_force = ForceBalance(
@@ -110,6 +123,8 @@ obj_force = ForceBalance(
     weight=1e3,
     normalize=True
 )
+obj_force.build(eq)
+print(f"  Force Balance objective created. Initial force balance score: {obj_force.compute():.4e}")
 
 # 6. Define Constraints
 # We fix the Profiles and Flux, allowing the Boundary shape to change.
@@ -120,11 +135,14 @@ constraints = (
     FixBoundaryR(eq, fixed_surface=False), # Allow R boundary to move
     FixBoundaryZ(eq, fixed_surface=False)  # Allow Z boundary to move
 )
+print("  Constraints defined: FixPressure, FixIota, FixPsi, FixBoundaryR, FixBoundaryZ.")
 
 # Combine into Objective Function
 objective = ObjectiveFunction(
     (obj_force, obj_omnigenity, obj_mercier)
 )
+objective.build(eq)
+print(f"  Combined objective function created. Initial total objective value: {objective.compute():.4e}")
 
 # 7. Run Optimization
 print("  Starting DESC Optimization (Proximal Projection)...")
@@ -137,7 +155,7 @@ result = optimizer.optimize(
     ftol=1e-4,
     xtol=1e-4,
     gtol=1e-4,
-    maxiter=20, 
+    maxiter=20,
     verbose=2
 )
 
@@ -161,11 +179,11 @@ ntor = desc_surf.N
 
 # Initialize SIMSOPT Surface
 s_simsopt = SurfaceRZFourier(
-    nfp=NFP, 
-    stellsym=True, 
-    mpol=mpol, 
+    nfp=NFP,
+    stellsym=True,
+    mpol=mpol,
     ntor=ntor,
-    quadpoints_phi=64, 
+    quadpoints_phi=64,
     quadpoints_theta=64
 )
 
@@ -180,14 +198,17 @@ for i in range(desc_surf.R_basis.modes.shape[0]):
             # R coefficients (Cosine)
             rc_val = desc_surf.R_lmn[i]
             s_simsopt.set_rc(m, n, rc_val)
-            
+
             # Z coefficients (Sine) - Note: Z basis index might differ
             if i < len(desc_surf.Z_lmn):
                 zs_val = desc_surf.Z_lmn[i]
                 s_simsopt.set_zs(m, n, zs_val)
 
 # Update surface geometry
-s_simsopt.local_full_x = s_simsopt.get_rc(0,0) # Trigger update
+# s_simsopt.local_full_x = s_simsopt.get_rc(0,0) # Trigger update
+
+print("  SIMSOPT surface created from optimized DESC equilibrium.")
+print(f"  SIMSOPT surface mpol={s_simsopt.mpol}, ntor={s_simsopt.ntor}")
 
 # 2. Define Coil Geometry (Modular Coils)
 # Create 4 unique coils per half period -> 4 * 2 * 5 = 40 coils total.
@@ -211,11 +232,11 @@ coils = []
 for curve in base_curves:
     # Set current object
     curr = Current(base_current)
-    curr.fix_all() # Fix current initially, or let it float if needed. 
+    curr.fix_all() # Fix current initially, or let it float if needed.
     # For HTS, we often fix current and optimize shape, or optimize both.
     # Here we unfix current to allow precise B-field matching.
     curr.unfix_all()
-    
+
     coils.append(simsopt.field.Coil(curve, curr))
 
 # Apply symmetries to get full coil set
@@ -223,16 +244,21 @@ coils_all = coils_via_symmetries(coils, s_simsopt.nfp, True)
 bs = BiotSavart(coils_all)
 bs.x = s_simsopt.gamma() # Evaluate on surface
 
+print(f"  {len(coils_all)} coils initialized.")
+print(f"  Initial current for each coil: {base_current:.1e} A.")
+
 # 3. Define Optimization Penalties (The "Cost" Function)
 
 # A. Magnetic Field Error (Squared Flux)
 # Minimize integral (B . n)^2 over the surface
 J_flux = SquaredFlux(s_simsopt, bs)
+print(f"  SquaredFlux objective created. Initial value: {J_flux.J():.4e}")
 
 # B. Length Penalty (Cost/Inductance)
 J_length = QuadraticPenalty(0.0)
 for coil in coils:
     J_length = J_length + CurveLength(coil.curve)
+print(f"  Length Penalty objective created. Initial value: {J_length.J():.4e}")
 
 # C. Curvature Penalty (HTS Strain Constraint)
 # Max Kappa < 0.8. We penalize if kappa > 0.8
@@ -241,15 +267,18 @@ for coil in coils:
     # Use 'threshold' penalty: max(0, kappa - 0.8)^2
     curve = coil.curve
     J_curvature = J_curvature + LpCurveCurvature(curve, kappa_threshold=MAX_KAPPA, exponent=2)
+print(f"  Curvature Penalty objective created. Initial value: {J_curvature.J():.4e}")
 
 # D. Coil-to-Coil Distance (Maintenance)
 # Min distance > 0.8m.
 J_cc_dist = CurveCurveDistance(coils, MIN_COIL_DIST_COIL, num_basecurves=n_coils_per_half_period)
+print(f"  Coil-to-Coil Distance objective created. Initial value: {J_cc_dist.J():.4e}")
 
 # E. Coil-to-Plasma Distance (Blanket/Shielding)
 # Min distance > 1.475m.
 # We use CurveSurfaceDistance.
 J_cs_dist = CurveSurfaceDistance(coils, s_simsopt, PLASMA_COIL_MIN_DIST)
+print(f"  Coil-to-Plasma Distance objective created. Initial value: {J_cs_dist.J():.4e}")
 
 # 4. Total Objective Function
 # Weights must be tuned. We adhere to "Absolute Optimization" request.
@@ -266,7 +295,7 @@ JF = (WEIGHT_FLUX * J_flux) + \
      (WEIGHT_CC_DIST * J_cc_dist) + \
      (WEIGHT_CS_DIST * J_cs_dist)
 
-print(f"  Initial Objective Value: {JF.J():.4e}")
+print(f"  Initial Total SIMSOPT Objective Value: {JF.J():.4e}")
 
 # 5. Run Coil Optimization
 print("  Starting SIMSOPT Coil Optimization (L-BFGS-B)...")

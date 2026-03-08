@@ -194,12 +194,32 @@ def optimize_coils(eq: Equilibrium) -> list[Coil]:
     curvature = CurveCurvature(seed_curves, threshold=MAX_KAPPA)
     coil_separation = MinimumDistance(seed_curves, min_dist=MIN_COIL_TO_COIL_DISTANCE)
 
+    def current_limit_violation() -> float:
+        current_values = np.array([abs(float(current.get_value())) for current in currents])
+        violation = np.maximum(current_values - MAX_COIL_CURRENT, 0.0)
+        return float(np.sqrt(np.sum(violation**2)))
+
+    def plasma_coil_spacing_violation() -> float:
+        surface_points = simsopt_surface.gamma().reshape((-1, 3))
+        spacing_violations = []
+        for curve in seed_curves:
+            curve_points = curve.gamma()
+            distances = np.linalg.norm(
+                curve_points[:, None, :] - surface_points[None, :, :],
+                axis=2,
+            )
+            min_distance = np.min(distances)
+            spacing_violations.append(max(0.0, MIN_PLASMA_COIL_DISTANCE - min_distance))
+        return float(np.sqrt(np.sum(np.square(spacing_violations))))
+
     lsq_problem = LeastSquaresProblem.from_tuples(
         [
             (flux.J, 0.0, 1.0),
             (length.J, 0.0, LENGTH_PENALTY_WEIGHT * 2.0e-5),
             (curvature.J, 0.0, 7.0e-3),
             (coil_separation.J, 0.0, 2.0e1),
+            (current_limit_violation, 0.0, 5.0e1),
+            (plasma_coil_spacing_violation, 0.0, 5.0e1),
         ]
     )
 
